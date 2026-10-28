@@ -1,0 +1,6 @@
+{
+    "template_cpu1": "avrdude -p atmega328p -c arduino -P {port} -b 115200 -U flash:w:\"{firmware}\":i",
+    "template_cpu2": "avrdude -p atmega328p -c arduino -P {port} -b 115200 -U flash:w:\"{firmware}\":i",
+    "bat_cpu1": "",
+    "bat_cpu2": ""
+}

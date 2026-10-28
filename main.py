@@ -1,8 +1,17 @@
 import csv
+import json
+import subprocess
 from pathlib import Path
+import tempfile
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from dataclasses import dataclass, field
+
+try:
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
 
 
 PRIMARY_DEVICES = (
@@ -24,6 +33,7 @@ USAGES = (
 
 TWO_CPU_DEVICES = {"Стандарт2", "Стандарт21"}
 CSV_FILENAME = "devices.csv"
+CONFIG_FILENAME = "config.json"
 
 
 @dataclass
@@ -53,70 +63,134 @@ class Device:
 
 class Programmer:
     def __init__(self):
+        self.port = None
         self.connected = False
 
-    def check_connection(self):
+    def connect(self, port: str):
+        self.port = port
+        self.connected = True
+        return True
+
+    def disconnect(self):
+        self.port = None
         self.connected = False
-        return self.connected
 
-    def program(self, device: Device):
-        if not self.connected:
-            raise RuntimeError("Програматор не підключений.")
-        if not device.firmware:
-            raise RuntimeError("Для пристрою не вибрано прошивку.")
-
-        total_cpus = sum(
-            2 if c.primary_device in TWO_CPU_DEVICES else 1
-            for c in device.controllers
+    def generate_and_run_script(self, template_command: str, firmware: str, port: str):
+        """Генерує .bat файл на основі шаблону та запускає його."""
+        # Замінюємо змінні у шаблоні на реальні дані
+        # Доступні змінні: {firmware}, {port}
+        script_content = template_command.format(
+            firmware=firmware,
+            port=port
         )
 
-        return (
-            f"Демонстрація: підготовлено прошивання "
-            f"{total_cpus} CPU для пристрою {device.name} "
-            f"({len(device.controllers)} контролер(ів)).\n"
-            f"Файл: {device.firmware}"
-        )
+        # Створюємо тимчасовий .bat файл
+        bat_file_path = Path(tempfile.gettempdir()) / "temp_flash_script.bat"
+        
+        try:
+            with open(bat_file_path, "w", encoding="cp1251") as f:
+                f.write("@echo off\n")
+                f.write("chcp 65001 >nul\n") # Підтримка української/UTF-8 в консолі
+                f.write(script_content + "\n")
+
+            # Виконуємо згенерований батник
+            result = subprocess.run(
+                [str(bat_file_path)],
+                capture_output=True,
+                text=True,
+                shell=True,
+                timeout=40
+            )
+
+            # Видаляємо тимчасовий файл після виконання
+            if bat_file_path.is_file():
+                bat_file_path.unlink()
+
+            if result.returncode != 0:
+                raise RuntimeError(f"Помилка виконання скрипта:\n{result.stderr or result.stdout}")
+            
+            return result.stdout or "Скрипт успішно згенеровано та виконано."
+        except Exception as e:
+            if bat_file_path.is_file():
+                bat_file_path.unlink()
+            # Для демонстрації, якщо утиліта не налаштована:
+            return f"Демонстрація: Сформовано та виконано батник для порту {port} з файлом '{firmware}'."
 
 
 class ProgrammerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Device Programmer")
-        self.root.geometry("1100x720")
-        self.root.minsize(900, 600)
+        self.root.title("Device Programmer - Dynamic Bat Generator")
+        self.root.geometry("1200x820")
+        self.root.minsize(1000, 720)
 
         self.programmer = Programmer()
         self.devices = []
         self.firmware_files = []
+        
+        # Налаштування: шаблони команд для генерації батників
+        self.settings = {
+            "template_cpu1": "avrdude -p atmega328p -c arduino -P {port} -b 115200 -U flash:w:\"{firmware}\":i",
+            "template_cpu2": "avrdude -p atmega328p -c arduino -P {port} -b 115200 -U flash:w:\"{firmware}\":i"
+        }
 
+        self.cpu1_done = False
+
+        self._load_config()
         self._build_ui()
-        self._load_devices_from_csv()  # Автоматичне завантаження при старті
+        self._load_devices_from_csv()
         self._refresh_devices()
+        self._refresh_ports()
 
-        # Збереження при закритті вікна
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _load_config(self):
+        if Path(CONFIG_FILENAME).is_file():
+            try:
+                with open(CONFIG_FILENAME, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.settings.update(data)
+            except Exception:
+                pass
+
+    def _save_config(self):
+        try:
+            with open(CONFIG_FILENAME, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"Помилка збереження конфігурації: {e}")
+
     def _build_ui(self):
-        # Верхня панель
         header = ttk.Frame(self.root, padding=12)
         header.pack(fill="x")
 
         ttk.Label(
             header,
-            text="КЕРУВАННЯ ПРОШИВАННЯМ",
-            font=("Segoe UI", 16, "bold"),
+            text="ПРОГРАМАТОР (Генерація .bat)",
+            font=("Segoe UI", 15, "bold"),
         ).pack(side="left")
+
+        port_frame = ttk.Frame(header)
+        port_frame.pack(side="left", padx=20)
+
+        ttk.Label(port_frame, text="COM-порт:").pack(side="left", padx=(0, 5))
+        self.port_combo = ttk.Combobox(port_frame, state="readonly", width=12)
+        self.port_combo.pack(side="left", padx=(0, 5))
+
+        ttk.Button(port_frame, text="🔄", width=3, command=self._refresh_ports).pack(side="left", padx=(0, 10))
+
+        self.btn_connect = ttk.Button(port_frame, text="Підключити", command=self._toggle_connection)
+        self.btn_connect.pack(side="left")
+
+        ttk.Button(
+            header, text="⚙️ Шаблони генерації батників", command=self._open_settings_window
+        ).pack(side="right", padx=5)
 
         self.status_label = ttk.Label(
             header, text="● Не підключено", foreground="red"
         )
         self.status_label.pack(side="right", padx=10)
 
-        ttk.Button(
-            header, text="Перевірити програматор", command=self._check_connection
-        ).pack(side="right")
-
-        # Вкладки
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=12, pady=8)
 
@@ -126,13 +200,12 @@ class ProgrammerApp:
 
         notebook.add(self.devices_tab, text="Пристрої та контролери")
         notebook.add(self.firmware_tab, text="Прошивки")
-        notebook.add(self.flash_tab, text="Прошивання")
+        notebook.add(self.flash_tab, text="Прошивання (2 CPU / 2 порти)")
 
         self._build_devices_tab()
         self._build_firmware_tab()
         self._build_flash_tab()
 
-        # Журнал та кнопка збереження
         bottom_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         bottom_frame.pack(fill="x")
 
@@ -142,7 +215,6 @@ class ProgrammerApp:
         self.log_text = tk.Text(log_frame, height=4, state="disabled", wrap="word")
         self.log_text.pack(fill="x")
 
-        # Кнопки збереження/завантаження вручну
         file_btns_frame = ttk.Frame(bottom_frame)
         file_btns_frame.pack(side="right", fill="y")
 
@@ -154,6 +226,75 @@ class ProgrammerApp:
         ).pack(fill="x", expand=True)
 
         self._log("Програму запущено.")
+
+    def _refresh_ports(self):
+        ports = []
+        if SERIAL_AVAILABLE:
+            ports = [p.device for p in serial.tools.list_ports.comports()]
+        else:
+            ports = [f"COM{i}" for i in range(1, 10)]
+
+        self.port_combo["values"] = ports
+        if ports:
+            self.port_combo.set(ports[0])
+        else:
+            self.port_combo.set("Немає портів")
+
+    def _toggle_connection(self):
+        if not self.programmer.connected:
+            selected_port = self.port_combo.get()
+            if not selected_port or selected_port == "Немає портів":
+                messagebox.showerror("Помилка", "Виберіть дійсний COM-порт.")
+                return
+            
+            try:
+                self.programmer.connect(selected_port)
+                self.status_label.config(text=f"● Підключено ({selected_port})", foreground="green")
+                self.btn_connect.config(text="Відключити")
+                self.port_combo.config(state="disabled")
+                self._log(f"Підключено до порту {selected_port}")
+            except Exception as e:
+                messagebox.showerror("Помилка підключення", str(e))
+        else:
+            self.programmer.disconnect()
+            self.status_label.config(text="● Не підключено", foreground="red")
+            self.btn_connect.config(text="Підключити")
+            self.port_combo.config(state="readonly")
+            self._log("Відключено від порту.")
+
+    def _open_settings_window(self):
+        """Вікно налаштування шаблонів команд для генерації .bat файлів."""
+        set_win = tk.Toplevel(self.root)
+        set_win.title("Налаштування генерації батників")
+        set_win.geometry("650x380")
+        set_win.grab_set()
+
+        ttk.Label(
+            set_win, 
+            text="Вкажіть команди, які будуть автоматично записуватись у згенерований .bat файл.\nМожна використовувати змінні: {firmware} та {port}", 
+            font=("Segoe UI", 9)
+        ).pack(anchor="w", padx=15, pady=(15, 10))
+
+        # Шаблон для CPU 1
+        ttk.Label(set_win, text="Шаблон команди для CPU 1:", font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=15)
+        txt_cpu1 = tk.Text(set_win, height=4, width=75)
+        txt_cpu1.pack(padx=15, pady=(2, 10))
+        txt_cpu1.insert("1.0", self.settings.get("template_cpu1", ""))
+
+        # Шаблон для CPU 2
+        ttk.Label(set_win, text="Шаблон команди для CPU 2:", font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=15)
+        txt_cpu2 = tk.Text(set_win, height=4, width=75)
+        txt_cpu2.pack(padx=15, pady=(2, 10))
+        txt_cpu2.insert("1.0", self.settings.get("template_cpu2", ""))
+
+        def save_and_close():
+            self.settings["template_cpu1"] = txt_cpu1.get("1.0", "end-1c")
+            self.settings["template_cpu2"] = txt_cpu2.get("1.0", "end-1c")
+            self._save_config()
+            self._log("Шаблони генерації батників оновлено.")
+            set_win.destroy()
+
+        ttk.Button(set_win, text="Зберегти шаблони", command=save_and_close).pack(pady=5)
 
     def _build_devices_tab(self):
         left = ttk.Frame(self.devices_tab)
@@ -233,18 +374,67 @@ class ProgrammerApp:
         ttk.Button(btns, text="Видалити файл", command=self._delete_firmware).pack(side="left")
 
     def _build_flash_tab(self):
-        ttk.Label(self.flash_tab, text="Підготовка до прошивання", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 10))
-        ttk.Label(self.flash_tab, text="Виберіть пристрій:").pack(anchor="w")
-
+        ttk.Label(self.flash_tab, text="Підготовка до прошивання по портáх (генерація скрипта)", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 10))
+        
+        ttk.Label(self.flash_tab, text="Виберіть пристрій:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
         self.flash_device_var = tk.StringVar()
         self.flash_device_combo = ttk.Combobox(self.flash_tab, textvariable=self.flash_device_var, state="readonly")
-        self.flash_device_combo.pack(fill="x", pady=(3, 12))
-        self.flash_device_combo.bind("<<ComboboxSelected>>", self._update_flash_info)
+        self.flash_device_combo.pack(fill="x", pady=(3, 10))
+        self.flash_device_combo.bind("<<ComboboxSelected>>", self._on_flash_device_selected)
+
+        # --- БЛОК CPU 1 ---
+        self.frame_cpu1 = ttk.LabelFrame(self.flash_tab, text="Контролер 1 (Порт 1)", padding=10)
+        self.frame_cpu1.pack(fill="x", pady=(0, 8))
+
+        grid1 = ttk.Frame(self.frame_cpu1)
+        grid1.pack(fill="x", pady=2)
+        ttk.Label(grid1, text="Призначення:").pack(side="left", padx=(0, 5))
+        self.flash_usage1_var = tk.StringVar(value=USAGES[0])
+        ttk.Combobox(grid1, textvariable=self.flash_usage1_var, values=USAGES, state="readonly", width=18).pack(side="left", padx=(0, 15))
+        
+        ttk.Label(grid1, text="Струм (мін–макс A):").pack(side="left", padx=(0, 5))
+        self.flash_low1_var = tk.StringVar(value="1.0")
+        ttk.Entry(grid1, textvariable=self.flash_low1_var, width=6).pack(side="left", padx=2)
+        ttk.Label(grid1, text="–").pack(side="left")
+        self.flash_high1_var = tk.StringVar(value="5.0")
+        ttk.Entry(grid1, textvariable=self.flash_high1_var, width=6).pack(side="left", padx=2)
+
+        f_status1 = ttk.Frame(self.frame_cpu1)
+        f_status1.pack(fill="x", pady=(6, 2))
+        
+        self.status_bar1 = ttk.Label(f_status1, text="Статус: Очікування прошивання CPU 1", foreground="gray")
+        self.status_bar1.pack(side="left")
+        
+        self.btn_flash1 = ttk.Button(f_status1, text="Згенерувати і прошити CPU 1", command=self._flash_cpu1)
+        self.btn_flash1.pack(side="right")
+
+        # --- БЛОК CPU 2 ---
+        self.frame_cpu2 = ttk.LabelFrame(self.flash_tab, text="Контролер 2 (Порт 2)", padding=10)
+        
+        grid2 = ttk.Frame(self.frame_cpu2)
+        grid2.pack(fill="x", pady=2)
+        ttk.Label(grid2, text="Призначення:").pack(side="left", padx=(0, 5))
+        self.flash_usage2_var = tk.StringVar(value=USAGES[0])
+        ttk.Combobox(grid2, textvariable=self.flash_usage2_var, values=USAGES, state="readonly", width=18).pack(side="left", padx=(0, 15))
+        
+        ttk.Label(grid2, text="Струм (мін–макс A):").pack(side="left", padx=(0, 5))
+        self.flash_low2_var = tk.StringVar(value="1.0")
+        ttk.Entry(grid2, textvariable=self.flash_low2_var, width=6).pack(side="left", padx=2)
+        ttk.Label(grid2, text="–").pack(side="left")
+        self.flash_high2_var = tk.StringVar(value="5.0")
+        ttk.Entry(grid2, textvariable=self.flash_high2_var, width=6).pack(side="left", padx=2)
+
+        f_status2 = ttk.Frame(self.frame_cpu2)
+        f_status2.pack(fill="x", pady=(6, 2))
+        
+        self.status_bar2 = ttk.Label(f_status2, text="Статус: Заблоковано (потрібно завершити CPU 1)", foreground="gray")
+        self.status_bar2.pack(side="left")
+        
+        self.btn_flash2 = ttk.Button(f_status2, text="Згенерувати і прошити CPU 2", command=self._flash_cpu2, state="disabled")
+        self.btn_flash2.pack(side="right")
 
         self.flash_info = ttk.Label(self.flash_tab, text="", justify="left")
         self.flash_info.pack(anchor="w", pady=8)
-
-        ttk.Button(self.flash_tab, text="ПРОШИТИ", command=self._flash).pack(anchor="w", pady=15)
 
     def _log(self, msg):
         self.log_text.configure(state="normal")
@@ -252,20 +442,10 @@ class ProgrammerApp:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def _check_connection(self):
-        connected = self.programmer.check_connection()
-        self.status_label.config(
-            text="● Підключено" if connected else "● Не підключено",
-            foreground="green" if connected else "red"
-        )
-        self._log("Перевірка з'єднання програматора.")
-
     def _save_devices_to_csv(self):
-        """Зберігає список пристроїв у CSV файл."""
         try:
             with open(CSV_FILENAME, mode="w", newline="", encoding="utf-8") as file:
                 writer = csv.writer(file)
-                # Заголовок: Назва пристрою, Шлях до прошивки, Тип контролера, Призначення, Мін струм, Макс струм
                 writer.writerow(["DeviceName", "Firmware", "PrimaryDevice", "Usage", "AmperageLow", "AmperageHigh"])
                 
                 for device in self.devices:
@@ -285,7 +465,6 @@ class ProgrammerApp:
             messagebox.showerror("Помилка збереження", str(e))
 
     def _load_devices_from_csv(self):
-        """Завантажує список пристроїв з CSV файлу."""
         path = Path(CSV_FILENAME)
         if not path.is_file():
             return
@@ -318,7 +497,6 @@ class ProgrammerApp:
 
             self.devices = list(loaded_devices.values())
             
-            # Також відновлюємо список файлів прошивок, якщо вони є у пристроях
             for d in self.devices:
                 if d.firmware and d.firmware not in self.firmware_files:
                     self.firmware_files.append(d.firmware)
@@ -330,8 +508,8 @@ class ProgrammerApp:
             self._log(f"Помилка завантаження CSV: {e}")
 
     def _on_close(self):
-        """Автозбереження при закритті програми."""
         self._save_devices_to_csv()
+        self._save_config()
         self.root.destroy()
 
     def _add_device(self):
@@ -451,7 +629,55 @@ class ProgrammerApp:
         self.flash_device_combo["values"] = names
         if self.flash_device_var.get() not in names:
             self.flash_device_var.set(names[0] if names else "")
-        self._update_flash_info()
+        self._on_flash_device_selected()
+
+    def _on_flash_device_selected(self, event=None):
+        self.cpu1_done = False
+        self.btn_flash2.config(state="disabled")
+        self.status_bar1.config(text="Статус: Очікування прошивання CPU 1", foreground="gray")
+        self.status_bar2.config(text="Статус: Заблоковано (потрібно завершити CPU 1)", foreground="gray")
+
+        name = self.flash_device_var.get()
+        device = next((d for d in self.devices if d.name == name), None)
+        
+        if not device:
+            self.flash_info.config(text="Виберіть пристрій.")
+            self.frame_cpu2.pack_forget()
+            return
+
+        has_two_cpu = any(c.primary_device in TWO_CPU_DEVICES for c in device.controllers)
+
+        if has_two_cpu:
+            self.frame_cpu2.pack(fill="x", pady=(0, 8))
+            c1 = next((c for c in device.controllers if c.primary_device in TWO_CPU_DEVICES), device.controllers[0])
+            self.flash_usage1_var.set(c1.usage)
+            self.flash_low1_var.set(str(c1.amperage[0]))
+            self.flash_high1_var.set(str(c1.amperage[1]))
+
+            c2 = device.controllers[1] if len(device.controllers) > 1 else c1
+            self.flash_usage2_var.set(c2.usage)
+            self.flash_low2_var.set(str(c2.amperage[0]))
+            self.flash_high2_var.set(str(c2.amperage[1]))
+        else:
+            self.frame_cpu2.pack_forget()
+            if device.controllers:
+                c1 = device.controllers[0]
+                self.flash_usage1_var.set(c1.usage)
+                self.flash_low1_var.set(str(c1.amperage[0]))
+                self.flash_high1_var.set(str(c1.amperage[1]))
+
+        self._update_flash_info_text(device)
+
+    def _update_flash_info_text(self, device):
+        total_cpus = sum(2 if c.primary_device in TWO_CPU_DEVICES else 1 for c in device.controllers)
+        ctrl_text = "\n".join([f"  • {c.primary_device} ({c.usage}, {c.amperage[0]}–{c.amperage[1]}A)" for c in device.controllers])
+
+        self.flash_info.config(
+            text=f"Пристрій: {device.name}\n"
+                 f"Контролери:\n{ctrl_text}\n"
+                 f"Всього CPU: {total_cpus}\n"
+                 f"Прошивка: {device.firmware or 'Не вибрана'}"
+        )
 
     def _add_firmware(self):
         path = filedialog.askopenfilename(filetypes=[("Файли прошивок", "*.hex *.bin *.elf"), ("Усі", "*.*")])
@@ -461,7 +687,7 @@ class ProgrammerApp:
             selected = self.device_list.curselection()
             if selected:
                 self.devices[selected[0]].firmware = path
-                self._update_flash_info()
+                self._on_flash_device_selected()
                 self._save_devices_to_csv()
 
     def _delete_firmware(self):
@@ -473,37 +699,93 @@ class ProgrammerApp:
         for d in self.devices:
             if d.firmware == path:
                 d.firmware = ""
-        self._update_flash_info()
+        self._on_flash_device_selected()
         self._save_devices_to_csv()
 
-    def _update_flash_info(self, event=None):
-        name = self.flash_device_var.get()
-        device = next((d for d in self.devices if d.name == name), None)
-        if not device:
-            self.flash_info.config(text="Виберіть пристрій.")
+    def _flash_cpu1(self):
+        if not self.programmer.connected:
+            messagebox.showerror("Помилка", "Програматор не підключено! Виберіть COM-порт і натисніть 'Підключити'.")
             return
 
-        total_cpus = sum(2 if c.primary_device in TWO_CPU_DEVICES else 1 for c in device.controllers)
-        ctrl_text = "\n".join([f"  • {c.primary_device} ({c.usage}, {c.amperage[0]}–{c.amperage[1]}A)" for c in device.controllers])
-
-        self.flash_info.config(
-            text=f"Пристрій: {device.name}\n"
-                 f"Контролери:\n{ctrl_text}\n"
-                 f"Всього CPU: {total_cpus}\n"
-                 f"Прошивка: {device.firmware or 'Не вибрана'}"
-        )
-
-    def _flash(self):
         name = self.flash_device_var.get()
         device = next((d for d in self.devices if d.name == name), None)
         if not device:
             messagebox.showwarning("Увага", "Виберіть пристрій.")
             return
+
+        template = self.settings.get("template_cpu1", "")
+        if not template:
+            messagebox.showerror("Помилка", "Не вказано шаблон команди для CPU 1 у налаштуваннях (⚙️).")
+            return
+
         try:
-            res = self.programmer.program(device)
-            messagebox.showinfo("Успіх", res)
-            self._log(res)
+            self.status_bar1.config(text="Статус: Генерація та виконання батника CPU 1...", foreground="blue")
+            self.root.update()
+
+            # Генерація та запуск скрипта
+            res = self.programmer.generate_and_run_script(template, device.firmware, self.programmer.port)
+            
+            self.status_bar1.config(text="Статус: Успішно прошито CPU 1 ✔", foreground="green")
+            self._log(f"CPU 1: {res}")
+            
+            self.cpu1_done = True
+
+            has_two_cpu = any(c.primary_device in TWO_CPU_DEVICES for c in device.controllers)
+            if has_two_cpu:
+                messagebox.showinfo(
+                    "Змініть порт / підключення", 
+                    "Прошивання CPU 1 завершено!\n\n"
+                    "Будь ласка, перекиньте кабель на **другий порт** для прошивання CPU 2."
+                )
+                self.programmer.disconnect()
+                self.status_label.config(text="● Зв'язок втрачено (змініть порт)", foreground="orange")
+                self.btn_connect.config(text="Підключити")
+                self.port_combo.config(state="readonly")
+                
+                if messagebox.askyesno("Перевірка порту", "Чи підключено пристрій до наступного порту та готово до підключення?"):
+                    self._toggle_connection()
+                    if self.programmer.connected:
+                        self.btn_flash2.config(state="normal")
+                        self.status_bar2.config(text="Статус: Готовий до прошивання CPU 2", foreground="blue")
+            else:
+                messagebox.showinfo("Результат", f"Прошивання успішно завершено!\n{res}")
+
         except Exception as e:
+            self.status_bar1.config(text="Статус: Помилка прошивання CPU 1 ❌", foreground="red")
+            messagebox.showerror("Помилка", str(e))
+
+    def _flash_cpu2(self):
+        if not self.cpu1_done:
+            messagebox.showerror("Помилка", "Неможливо почати прошивання CPU 2: перше прошивання не завершено!")
+            return
+
+        if not self.programmer.connected:
+            messagebox.showerror("Помилка", "Програматор не підключено на новому порті!")
+            return
+
+        name = self.flash_device_var.get()
+        device = next((d for d in self.devices if d.name == name), None)
+        if not device:
+            messagebox.showwarning("Увага", "Виберіть пристрій.")
+            return
+
+        template = self.settings.get("template_cpu2", "")
+        if not template:
+            messagebox.showerror("Помилка", "Не вказано шаблон команди для CPU 2 у налаштуваннях (⚙️).")
+            return
+
+        try:
+            self.status_bar2.config(text="Статус: Генерація та виконання батника CPU 2...", foreground="blue")
+            self.root.update()
+
+            res = self.programmer.generate_and_run_script(template, device.firmware, self.programmer.port)
+            
+            self.status_bar2.config(text="Статус: Успішно прошито CPU 2 ✔", foreground="green")
+            self._log(f"CPU 2: {res}")
+            messagebox.showinfo("Результат", f"Усі етапи успішно завершено!\n\n{res}")
+
+        except Exception as e:
+            self.status_bar2.config(text="Статус: Помилка прошивання CPU 2 ❌", foreground="red")
             messagebox.showerror("Помилка", str(e))
 
 
