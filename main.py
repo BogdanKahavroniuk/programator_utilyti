@@ -2,12 +2,12 @@ import csv
 import json
 import subprocess
 from pathlib import Path
-import tempfile
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from dataclasses import dataclass, field
 
 try:
+    import serial
     import serial.tools.list_ports
     SERIAL_AVAILABLE = True
 except ImportError:
@@ -31,7 +31,6 @@ USAGES = (
     "Тепло",
 )
 
-TWO_CPU_DEVICES = {"Стандарт2", "Стандарт21"}
 CSV_FILENAME = "devices.csv"
 CONFIG_FILENAME = "config.json"
 
@@ -41,6 +40,7 @@ class Controller:
     primary_device: str
     amperage: tuple[float, float]
     usage: str
+    firmware: str = ""  # Прошивка прив'язана 1 до 1 до контролера
 
     def __post_init__(self):
         if self.primary_device not in PRIMARY_DEVICES:
@@ -58,83 +58,77 @@ class Controller:
 class Device:
     name: str
     controllers: list[Controller] = field(default_factory=list)
-    firmware: str = ""
 
 
 class Programmer:
     def __init__(self):
         self.port = None
         self.connected = False
+        self.serial_conn = None
 
     def connect(self, port: str):
-        self.port = port
-        self.connected = True
-        return True
+        if not SERIAL_AVAILABLE:
+            raise RuntimeError("Бібліотека pyserial не встановлена! Встановіть її: pip install pyserial")
+        
+        try:
+            self.serial_conn = serial.Serial(port, baudrate=115200, timeout=1)
+            self.port = port
+            self.connected = True
+            return True
+        except Exception as e:
+            self.connected = False
+            self.port = None
+            self.serial_conn = None
+            raise RuntimeError(f"Не вдалося підключитися до порту {port}.\nПомилка: {e}")
 
     def disconnect(self):
+        if self.serial_conn and self.serial_conn.is_open:
+            try:
+                self.serial_conn.close()
+            except Exception:
+                pass
+        self.serial_conn = None
         self.port = None
         self.connected = False
 
-    def generate_and_run_script(self, template_command: str, firmware: str, port: str):
-        """Генерує .bat файл на основі шаблону та запускає його."""
-        # Замінюємо змінні у шаблоні на реальні дані
-        # Доступні змінні: {firmware}, {port}
-        script_content = template_command.format(
-            firmware=firmware,
-            port=port
-        )
+    def run_bat_file(self, bat_path: str, firmware: str, port: str):
+        if not bat_path or not Path(bat_path).is_file():
+            raise RuntimeError(f"Файл батника не знайдено: {bat_path}")
 
-        # Створюємо тимчасовий .bat файл
-        bat_file_path = Path(tempfile.gettempdir()) / "temp_flash_script.bat"
-        
         try:
-            with open(bat_file_path, "w", encoding="cp1251") as f:
-                f.write("@echo off\n")
-                f.write("chcp 65001 >nul\n") # Підтримка української/UTF-8 в консолі
-                f.write(script_content + "\n")
-
-            # Виконуємо згенерований батник
             result = subprocess.run(
-                [str(bat_file_path)],
+                [bat_path],
                 capture_output=True,
                 text=True,
                 shell=True,
                 timeout=40
             )
-
-            # Видаляємо тимчасовий файл після виконання
-            if bat_file_path.is_file():
-                bat_file_path.unlink()
-
             if result.returncode != 0:
                 raise RuntimeError(f"Помилка виконання скрипта:\n{result.stderr or result.stdout}")
-            
-            return result.stdout or "Скрипт успішно згенеровано та виконано."
+            return result.stdout or "Батник виконано успішно."
         except Exception as e:
-            if bat_file_path.is_file():
-                bat_file_path.unlink()
-            # Для демонстрації, якщо утиліта не налаштована:
-            return f"Демонстрація: Сформовано та виконано батник для порту {port} з файлом '{firmware}'."
+            return f"Виконано батник '{bat_path}' для прошивки '{firmware}' (порт {port}). Результат: {e}"
 
 
 class ProgrammerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Device Programmer - Dynamic Bat Generator")
-        self.root.geometry("1200x820")
-        self.root.minsize(1000, 720)
+        self.root.title("Device Programmer - Controller to Firmware 1:1 Binding")
+        self.root.geometry("1280x950")
+        self.root.minsize(1100, 780)
 
         self.programmer = Programmer()
         self.devices = []
-        self.firmware_files = []
         
-        # Налаштування: шаблони команд для генерації батників
         self.settings = {
-            "template_cpu1": "avrdude -p atmega328p -c arduino -P {port} -b 115200 -U flash:w:\"{firmware}\":i",
-            "template_cpu2": "avrdude -p atmega328p -c arduino -P {port} -b 115200 -U flash:w:\"{firmware}\":i"
+            "selected_port": "COM1",
+            "bat_filename": "flash_script.bat",
+            "cmd_template": "STK500.exe -cUSB -I125kHz -dAtmega64 -s -e -i\"{firmware}\" -pb -vb -O0003 -Sf7fff -fD124 -EFF -FD124 -GFF -lFC -LFC"
         }
 
-        self.cpu1_done = False
+        self.current_flash_step = 0
+        self.flash_step_widgets = []
+        self.settings_visible = False
 
         self._load_config()
         self._build_ui()
@@ -166,46 +160,93 @@ class ProgrammerApp:
 
         ttk.Label(
             header,
-            text="ПРОГРАМАТОР (Генерація .bat)",
+            text="ПРОГРАМАТОР ПРИСТРОЇВ ТА КОНТРОЛЕРІВ",
             font=("Segoe UI", 15, "bold"),
         ).pack(side="left")
 
-        port_frame = ttk.Frame(header)
-        port_frame.pack(side="left", padx=20)
+        conn_frame = ttk.Frame(header)
+        conn_frame.pack(side="left", padx=20)
 
-        ttk.Label(port_frame, text="COM-порт:").pack(side="left", padx=(0, 5))
-        self.port_combo = ttk.Combobox(port_frame, state="readonly", width=12)
-        self.port_combo.pack(side="left", padx=(0, 5))
-
-        ttk.Button(port_frame, text="🔄", width=3, command=self._refresh_ports).pack(side="left", padx=(0, 10))
-
-        self.btn_connect = ttk.Button(port_frame, text="Підключити", command=self._toggle_connection)
-        self.btn_connect.pack(side="left")
-
-        ttk.Button(
-            header, text="⚙️ Шаблони генерації батників", command=self._open_settings_window
-        ).pack(side="right", padx=5)
+        self.btn_connect_quick = ttk.Button(conn_frame, text="Підключити", command=self._toggle_connection)
+        self.btn_connect_quick.pack(side="left", padx=(0, 10))
 
         self.status_label = ttk.Label(
-            header, text="● Не підключено", foreground="red"
+            conn_frame, text="● Не підключено", foreground="red"
         )
-        self.status_label.pack(side="right", padx=10)
+        self.status_label.pack(side="left", padx=(0, 15))
 
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=12, pady=8)
+        self.header_port_label = ttk.Label(
+            conn_frame, text="Порт не обрано", font=("Segoe UI", 9, "italic"), foreground="gray"
+        )
+        self.header_port_label.pack(side="left")
 
-        self.devices_tab = ttk.Frame(notebook, padding=12)
-        self.firmware_tab = ttk.Frame(notebook, padding=12)
-        self.flash_tab = ttk.Frame(notebook, padding=12)
+        self.btn_toggle_settings = ttk.Button(
+            header, text="⚙️ Налаштування та порти ▼", command=self._toggle_settings_dropdown
+        )
+        self.btn_toggle_settings.pack(side="right", padx=5)
 
-        notebook.add(self.devices_tab, text="Пристрої та контролери")
-        notebook.add(self.firmware_tab, text="Прошивки")
-        notebook.add(self.flash_tab, text="Прошивання (2 CPU / 2 порти)")
+        # --- СПЛИВАЮЧЕ МЕНЮ НАЛАШТУВАНЬ ---
+        self.dropdown_frame = ttk.LabelFrame(self.root, text="Параметри та створення .bat файлу", padding=12)
+
+        f_port = ttk.Frame(self.dropdown_frame)
+        f_port.pack(fill="x", pady=(0, 10))
+        
+        ttk.Label(f_port, text="Вибір COM-порту (1-7):", font=("Segoe UI", 9, "bold"), width=22).pack(side="left")
+        
+        self.port_combo = ttk.Combobox(f_port, state="readonly", width=15)
+        self.port_combo.pack(side="left", padx=5)
+        self.port_combo.bind("<<ComboboxSelected>>", self._on_port_selected)
+        
+        ttk.Button(f_port, text="🔄 Сканувати", command=self._refresh_ports).pack(side="left", padx=5)
+        
+        self.dropdown_selected_info = ttk.Label(f_port, text="", font=("Segoe UI", 9, "bold"), foreground="blue")
+        self.dropdown_selected_info.pack(side="left", padx=15)
+
+        ttk.Separator(self.dropdown_frame, orient="horizontal").pack(fill="x", pady=8)
+
+        f_bat_name = ttk.Frame(self.dropdown_frame)
+        f_bat_name.pack(fill="x", pady=4)
+        ttk.Label(f_bat_name, text="Назва/шлях батника:", width=20).pack(side="left")
+        self.ent_bat_name = ttk.Entry(f_bat_name, width=40)
+        self.ent_bat_name.pack(side="left", padx=5)
+        self.ent_bat_name.insert(0, self.settings.get("bat_filename", "flash_script.bat"))
+        
+        ttk.Button(f_bat_name, text="Вибрати файл...", command=self._browse_bat_file).pack(side="left", padx=5)
+
+        ttk.Label(
+            self.dropdown_frame, 
+            text="Шаблон команди STK500 для створення .bat (змінні: {firmware}, {port}):",
+            font=("Segoe UI", 9, "italic")
+        ).pack(anchor="w", pady=(8, 2))
+
+        f_in1 = ttk.Frame(self.dropdown_frame)
+        f_in1.pack(fill="x", pady=4)
+        ttk.Label(f_in1, text="Команда прошивання:", width=20).pack(side="left")
+        self.txt_cmd_template = tk.Text(f_in1, height=2, width=70)
+        self.txt_cmd_template.pack(side="left", padx=5, fill="x", expand=True)
+        self.txt_cmd_template.insert("1.0", self.settings.get("cmd_template", ""))
+
+        f_btns = ttk.Frame(self.dropdown_frame)
+        f_btns.pack(fill="x", pady=(10, 0))
+        
+        ttk.Button(
+            f_btns, text="💾 Зберегти налаштування", command=self._save_settings
+        ).pack(side="right")
+
+        # --- Основні вкладки ---
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=12, pady=8)
+
+        self.devices_tab = ttk.Frame(self.notebook, padding=12)
+        self.flash_tab = ttk.Frame(self.notebook, padding=12)
+
+        self.notebook.add(self.devices_tab, text="Пристрої, контролери та їх прошивки")
+        self.notebook.add(self.flash_tab, text="Прошивання пристрою (покроково)")
 
         self._build_devices_tab()
-        self._build_firmware_tab()
         self._build_flash_tab()
 
+        # Журнал та кнопки зберігання CSV
         bottom_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         bottom_frame.pack(fill="x")
 
@@ -227,80 +268,111 @@ class ProgrammerApp:
 
         self._log("Програму запущено.")
 
-    def _refresh_ports(self):
-        ports = []
-        if SERIAL_AVAILABLE:
-            ports = [p.device for p in serial.tools.list_ports.comports()]
+    def _toggle_settings_dropdown(self):
+        if self.settings_visible:
+            self.dropdown_frame.pack_forget()
+            self.btn_toggle_settings.config(text="⚙️ Налаштування та порти ▼")
+            self.settings_visible = False
         else:
-            ports = [f"COM{i}" for i in range(1, 10)]
+            self.dropdown_frame.pack(fill="x", padx=12, pady=(0, 8), before=self.notebook)
+            self.btn_toggle_settings.config(text="⚙️ Налаштування та порти ▲")
+            self.settings_visible = True
+
+    def _refresh_ports(self):
+        allowed_ports = [f"COM{i}" for i in range(1, 8)]
+
+        if SERIAL_AVAILABLE:
+            try:
+                found_ports = [p.device for p in serial.tools.list_ports.comports()]
+                ports = [p for p in found_ports if p.upper() in allowed_ports]
+                if not ports:
+                    ports = allowed_ports
+            except Exception as e:
+                ports = allowed_ports
+                self._log(f"Помилка сканування: {e}")
+        else:
+            ports = allowed_ports
 
         self.port_combo["values"] = ports
-        if ports:
+        saved_port = self.settings.get("selected_port", "")
+
+        if saved_port in ports:
+            self.port_combo.set(saved_port)
+        elif ports:
             self.port_combo.set(ports[0])
         else:
-            self.port_combo.set("Немає портів")
+            self.port_combo.set("")
+
+        self._on_port_selected()
+        self._log("Доступні COM-порти (COM1–COM7): " + ", ".join(ports))
+
+    def _on_port_selected(self, event=None):
+        port = self.port_combo.get().strip()
+        if port and port in self.port_combo["values"]:
+            self.settings["selected_port"] = port
+            self.dropdown_selected_info.config(
+                text=f"Обрано: {port}", foreground="blue"
+            )
+            self.header_port_label.config(
+                text=f"Порт: {port}", foreground="blue"
+            )
+            self._save_config()
+        else:
+            self.dropdown_selected_info.config(
+                text="Порт не обрано", foreground="gray"
+            )
+            self.header_port_label.config(
+                text="Порт не обрано", foreground="gray"
+            )
+
+    def _browse_bat_file(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".bat",
+            filetypes=[("Batch files", "*.bat"), ("All files", "*.*")],
+            title="Виберіть або створіть шлях до батника"
+        )
+        if path:
+            self.ent_bat_name.delete(0, tk.END)
+            self.ent_bat_name.insert(0, path)
+
+    def _save_settings(self):
+        self.settings["selected_port"] = self.port_combo.get()
+        self.settings["bat_filename"] = self.ent_bat_name.get().strip()
+        self.settings["cmd_template"] = self.txt_cmd_template.get("1.0", "end-1c").strip()
+        
+        self._save_config()
+        messagebox.showinfo("Успіх", "Налаштування успішно збережено!")
+        self._toggle_settings_dropdown()
 
     def _toggle_connection(self):
         if not self.programmer.connected:
             selected_port = self.port_combo.get()
-            if not selected_port or selected_port == "Немає портів":
-                messagebox.showerror("Помилка", "Виберіть дійсний COM-порт.")
+            if not selected_port:
+                messagebox.showerror("Помилка", "Виберіть дійсний COM-порт у налаштуваннях (⚙️).")
                 return
             
             try:
                 self.programmer.connect(selected_port)
-                self.status_label.config(text=f"● Підключено ({selected_port})", foreground="green")
-                self.btn_connect.config(text="Відключити")
+                self.status_label.config(text="● Підключено", foreground="green")
+                self.btn_connect_quick.config(text="Відключити")
                 self.port_combo.config(state="disabled")
-                self._log(f"Підключено до порту {selected_port}")
+                self._log(f"Успішно підключено до реального порту {selected_port}")
             except Exception as e:
+                self.status_label.config(text="● Не підключено", foreground="red")
                 messagebox.showerror("Помилка підключення", str(e))
+                self._log(f"Помилка підключення до {selected_port}: {e}")
         else:
             self.programmer.disconnect()
             self.status_label.config(text="● Не підключено", foreground="red")
-            self.btn_connect.config(text="Підключити")
+            self.btn_connect_quick.config(text="Підключити")
             self.port_combo.config(state="readonly")
             self._log("Відключено від порту.")
-
-    def _open_settings_window(self):
-        """Вікно налаштування шаблонів команд для генерації .bat файлів."""
-        set_win = tk.Toplevel(self.root)
-        set_win.title("Налаштування генерації батників")
-        set_win.geometry("650x380")
-        set_win.grab_set()
-
-        ttk.Label(
-            set_win, 
-            text="Вкажіть команди, які будуть автоматично записуватись у згенерований .bat файл.\nМожна використовувати змінні: {firmware} та {port}", 
-            font=("Segoe UI", 9)
-        ).pack(anchor="w", padx=15, pady=(15, 10))
-
-        # Шаблон для CPU 1
-        ttk.Label(set_win, text="Шаблон команди для CPU 1:", font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=15)
-        txt_cpu1 = tk.Text(set_win, height=4, width=75)
-        txt_cpu1.pack(padx=15, pady=(2, 10))
-        txt_cpu1.insert("1.0", self.settings.get("template_cpu1", ""))
-
-        # Шаблон для CPU 2
-        ttk.Label(set_win, text="Шаблон команди для CPU 2:", font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=15)
-        txt_cpu2 = tk.Text(set_win, height=4, width=75)
-        txt_cpu2.pack(padx=15, pady=(2, 10))
-        txt_cpu2.insert("1.0", self.settings.get("template_cpu2", ""))
-
-        def save_and_close():
-            self.settings["template_cpu1"] = txt_cpu1.get("1.0", "end-1c")
-            self.settings["template_cpu2"] = txt_cpu2.get("1.0", "end-1c")
-            self._save_config()
-            self._log("Шаблони генерації батників оновлено.")
-            set_win.destroy()
-
-        ttk.Button(set_win, text="Зберегти шаблони", command=save_and_close).pack(pady=5)
 
     def _build_devices_tab(self):
         left = ttk.Frame(self.devices_tab)
         left.pack(side="left", fill="y", padx=(0, 10))
 
-        ttk.Label(left, text="Пристрої", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 5))
+        ttk.Label(left, text="Пристрої (напр. CPO150)", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 5))
 
         self.device_list = tk.Listbox(left, height=18, width=28)
         self.device_list.pack(fill="y", expand=True, pady=(0, 5))
@@ -308,10 +380,10 @@ class ProgrammerApp:
 
         btn_frame = ttk.Frame(left)
         btn_frame.pack(fill="x")
-        ttk.Button(btn_frame, text="Додати", command=self._add_device).pack(side="left", expand=True, fill="x", padx=(0, 2))
+        ttk.Button(btn_frame, text="Додати пристрій", command=self._add_device).pack(side="left", expand=True, fill="x", padx=(0, 2))
         ttk.Button(btn_frame, text="Видалити", command=self._delete_device).pack(side="left", expand=True, fill="x", padx=(2, 0))
 
-        right = ttk.LabelFrame(self.devices_tab, text="Параметри пристрою та контролери", padding=12)
+        right = ttk.LabelFrame(self.devices_tab, text="Контролери та прошивки для вибраного пристрою", padding=12)
         right.pack(side="right", fill="both", expand=True)
 
         ttk.Label(right, text="Назва пристрою:").pack(anchor="w")
@@ -321,13 +393,14 @@ class ProgrammerApp:
         name_entry.bind("<FocusOut>", lambda e: self._save_device_name())
         name_entry.bind("<Return>", lambda e: self._save_device_name())
 
-        add_ctrl_frame = ttk.LabelFrame(right, text="Додати новий контролер до пристрою", padding=8)
+        # Фрейм додавання нового контролера
+        add_ctrl_frame = ttk.LabelFrame(right, text="Додати новий контролер та прошивку", padding=10)
         add_ctrl_frame.pack(fill="x", pady=(0, 10))
 
         grid_f = ttk.Frame(add_ctrl_frame)
         grid_f.pack(fill="x", pady=(0, 5))
 
-        ttk.Label(grid_f, text="Тип:").grid(row=0, column=0, sticky="w", padx=2)
+        ttk.Label(grid_f, text="Тип контролера:").grid(row=0, column=0, sticky="w", padx=2)
         self.new_type_var = tk.StringVar(value=PRIMARY_DEVICES[0])
         ttk.Combobox(grid_f, textvariable=self.new_type_var, values=PRIMARY_DEVICES, state="readonly", width=22).grid(row=0, column=1, padx=2, sticky="ew")
 
@@ -336,105 +409,62 @@ class ProgrammerApp:
         ttk.Combobox(grid_f, textvariable=self.new_usage_var, values=USAGES, state="readonly", width=18).grid(row=0, column=3, padx=2, sticky="ew")
 
         grid_f2 = ttk.Frame(add_ctrl_frame)
-        grid_f2.pack(fill="x")
+        grid_f2.pack(fill="x", pady=(5, 5))
 
-        ttk.Label(grid_f2, text="Мін. струм (A):").pack(side="left", padx=2)
+        ttk.Label(grid_f2, text="Струм (A): мін").pack(side="left", padx=2)
         self.new_low_var = tk.StringVar(value="1.0")
-        ttk.Entry(grid_f2, textvariable=self.new_low_var, width=8).pack(side="left", padx=2)
+        ttk.Entry(grid_f2, textvariable=self.new_low_var, width=6).pack(side="left", padx=2)
 
-        ttk.Label(grid_f2, text="Макс. струм (A):").pack(side="left", padx=2)
+        ttk.Label(grid_f2, text="макс").pack(side="left", padx=2)
         self.new_high_var = tk.StringVar(value="5.0")
-        ttk.Entry(grid_f2, textvariable=self.new_high_var, width=8).pack(side="left", padx=2)
+        ttk.Entry(grid_f2, textvariable=self.new_high_var, width=6).pack(side="left", padx=2)
 
-        ttk.Button(grid_f2, text="+ Додати контролер", command=self._add_controller).pack(side="right", padx=2)
+        grid_fw = ttk.Frame(add_ctrl_frame)
+        grid_fw.pack(fill="x", pady=(5, 5))
 
-        ttk.Label(right, text="Список контролерів у цьому пристрої:").pack(anchor="w", pady=(5, 2))
+        ttk.Label(grid_fw, text="Файл прошивки (.hex):").pack(side="left", padx=2)
+        self.new_fw_var = tk.StringVar()
+        ttk.Entry(grid_fw, textvariable=self.new_fw_var, state="readonly").pack(side="left", fill="x", expand=True, padx=5)
+        ttk.Button(grid_fw, text="Обзори...", command=self._browse_new_firmware).pack(side="left", padx=2)
+
+        ttk.Button(add_ctrl_frame, text="+ Додати контролер до пристрою", command=self._add_controller).pack(anchor="e", pady=(5, 0))
+
+        # Таблиця контролерів пристрою
+        ttk.Label(right, text="Список контролерів та їх прошивок (1 до 1):", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(5, 2))
         
-        columns = ("type", "usage", "amperage")
-        self.tree = ttk.Treeview(right, columns=columns, show="headings", height=7)
+        columns = ("type", "usage", "amperage", "firmware")
+        self.tree = ttk.Treeview(right, columns=columns, show="headings", height=8)
         self.tree.heading("type", text="Тип контролера")
         self.tree.heading("usage", text="Призначення")
         self.tree.heading("amperage", text="Діапазон струму")
+        self.tree.heading("firmware", text="Прив'язана прошивка (Файл)")
         
-        self.tree.column("type", width=220, anchor="w")
-        self.tree.column("usage", width=150, anchor="w")
-        self.tree.column("amperage", width=120, anchor="center")
+        self.tree.column("type", width=180, anchor="w")
+        self.tree.column("usage", width=140, anchor="w")
+        self.tree.column("amperage", width=110, anchor="center")
+        self.tree.column("firmware", width=250, anchor="w")
         self.tree.pack(fill="both", expand=True, pady=(0, 8))
 
-        ttk.Button(right, text="Видалити вибраний контролер", command=self._delete_controller).pack(anchor="e")
-
-    def _build_firmware_tab(self):
-        ttk.Label(self.firmware_tab, text="Файли прошивок", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        self.firmware_list = tk.Listbox(self.firmware_tab, height=15)
-        self.firmware_list.pack(fill="both", expand=True, pady=8)
-
-        btns = ttk.Frame(self.firmware_tab)
-        btns.pack(fill="x")
-        ttk.Button(btns, text="Додати файл", command=self._add_firmware).pack(side="left", padx=(0, 5))
-        ttk.Button(btns, text="Видалити файл", command=self._delete_firmware).pack(side="left")
+        f_tbl_btns = ttk.Frame(right)
+        f_tbl_btns.pack(fill="x")
+        ttk.Button(f_tbl_btns, text="Змінити прошивку для вибраного", command=self._change_controller_firmware).pack(side="left")
+        ttk.Button(f_tbl_btns, text="Видалити вибраний контролер", command=self._delete_controller).pack(side="right")
 
     def _build_flash_tab(self):
-        ttk.Label(self.flash_tab, text="Підготовка до прошивання по портáх (генерація скрипта)", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 10))
+        ttk.Label(self.flash_tab, text="Підготовка до прошивання за пристроями", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 10))
         
-        ttk.Label(self.flash_tab, text="Виберіть пристрій:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        f_top = ttk.Frame(self.flash_tab)
+        f_top.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(f_top, text="Виберіть пристрій для прошивання:", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 10))
         self.flash_device_var = tk.StringVar()
-        self.flash_device_combo = ttk.Combobox(self.flash_tab, textvariable=self.flash_device_var, state="readonly")
-        self.flash_device_combo.pack(fill="x", pady=(3, 10))
+        self.flash_device_combo = ttk.Combobox(f_top, textvariable=self.flash_device_var, state="readonly", width=30)
+        self.flash_device_combo.pack(side="left")
         self.flash_device_combo.bind("<<ComboboxSelected>>", self._on_flash_device_selected)
 
-        # --- БЛОК CPU 1 ---
-        self.frame_cpu1 = ttk.LabelFrame(self.flash_tab, text="Контролер 1 (Порт 1)", padding=10)
-        self.frame_cpu1.pack(fill="x", pady=(0, 8))
-
-        grid1 = ttk.Frame(self.frame_cpu1)
-        grid1.pack(fill="x", pady=2)
-        ttk.Label(grid1, text="Призначення:").pack(side="left", padx=(0, 5))
-        self.flash_usage1_var = tk.StringVar(value=USAGES[0])
-        ttk.Combobox(grid1, textvariable=self.flash_usage1_var, values=USAGES, state="readonly", width=18).pack(side="left", padx=(0, 15))
-        
-        ttk.Label(grid1, text="Струм (мін–макс A):").pack(side="left", padx=(0, 5))
-        self.flash_low1_var = tk.StringVar(value="1.0")
-        ttk.Entry(grid1, textvariable=self.flash_low1_var, width=6).pack(side="left", padx=2)
-        ttk.Label(grid1, text="–").pack(side="left")
-        self.flash_high1_var = tk.StringVar(value="5.0")
-        ttk.Entry(grid1, textvariable=self.flash_high1_var, width=6).pack(side="left", padx=2)
-
-        f_status1 = ttk.Frame(self.frame_cpu1)
-        f_status1.pack(fill="x", pady=(6, 2))
-        
-        self.status_bar1 = ttk.Label(f_status1, text="Статус: Очікування прошивання CPU 1", foreground="gray")
-        self.status_bar1.pack(side="left")
-        
-        self.btn_flash1 = ttk.Button(f_status1, text="Згенерувати і прошити CPU 1", command=self._flash_cpu1)
-        self.btn_flash1.pack(side="right")
-
-        # --- БЛОК CPU 2 ---
-        self.frame_cpu2 = ttk.LabelFrame(self.flash_tab, text="Контролер 2 (Порт 2)", padding=10)
-        
-        grid2 = ttk.Frame(self.frame_cpu2)
-        grid2.pack(fill="x", pady=2)
-        ttk.Label(grid2, text="Призначення:").pack(side="left", padx=(0, 5))
-        self.flash_usage2_var = tk.StringVar(value=USAGES[0])
-        ttk.Combobox(grid2, textvariable=self.flash_usage2_var, values=USAGES, state="readonly", width=18).pack(side="left", padx=(0, 15))
-        
-        ttk.Label(grid2, text="Струм (мін–макс A):").pack(side="left", padx=(0, 5))
-        self.flash_low2_var = tk.StringVar(value="1.0")
-        ttk.Entry(grid2, textvariable=self.flash_low2_var, width=6).pack(side="left", padx=2)
-        ttk.Label(grid2, text="–").pack(side="left")
-        self.flash_high2_var = tk.StringVar(value="5.0")
-        ttk.Entry(grid2, textvariable=self.flash_high2_var, width=6).pack(side="left", padx=2)
-
-        f_status2 = ttk.Frame(self.frame_cpu2)
-        f_status2.pack(fill="x", pady=(6, 2))
-        
-        self.status_bar2 = ttk.Label(f_status2, text="Статус: Заблоковано (потрібно завершити CPU 1)", foreground="gray")
-        self.status_bar2.pack(side="left")
-        
-        self.btn_flash2 = ttk.Button(f_status2, text="Згенерувати і прошити CPU 2", command=self._flash_cpu2, state="disabled")
-        self.btn_flash2.pack(side="right")
-
-        self.flash_info = ttk.Label(self.flash_tab, text="", justify="left")
-        self.flash_info.pack(anchor="w", pady=8)
+        # Контейнер для покрокових блоків контролерів (динамічно створюється)
+        self.flash_steps_container = ttk.Frame(self.flash_tab)
+        self.flash_steps_container.pack(fill="both", expand=True)
 
     def _log(self, msg):
         self.log_text.configure(state="normal")
@@ -446,19 +476,19 @@ class ProgrammerApp:
         try:
             with open(CSV_FILENAME, mode="w", newline="", encoding="utf-8") as file:
                 writer = csv.writer(file)
-                writer.writerow(["DeviceName", "Firmware", "PrimaryDevice", "Usage", "AmperageLow", "AmperageHigh"])
+                writer.writerow(["DeviceName", "PrimaryDevice", "Usage", "AmperageLow", "AmperageHigh", "Firmware"])
                 
                 for device in self.devices:
                     if not device.controllers:
-                        writer.writerow([device.name, device.firmware, "", "", "", ""])
+                        writer.writerow([device.name, "", "", "", "", ""])
                     for c in device.controllers:
                         writer.writerow([
                             device.name,
-                            device.firmware,
                             c.primary_device,
                             c.usage,
                             c.amperage[0],
-                            c.amperage[1]
+                            c.amperage[1],
+                            c.firmware
                         ])
             self._log(f"Дані успішно збережено у файл {CSV_FILENAME}")
         except Exception as e:
@@ -475,33 +505,28 @@ class ProgrammerApp:
                 reader = csv.DictReader(file)
                 for row in reader:
                     name = row["DeviceName"]
-                    firmware = row["Firmware"]
                     p_dev = row["PrimaryDevice"]
                     usage = row["Usage"]
                     low = row["AmperageLow"]
                     high = row["AmperageHigh"]
+                    fw = row.get("Firmware", "")
 
                     if name not in loaded_devices:
-                        loaded_devices[name] = Device(name=name, firmware=firmware, controllers=[])
+                        loaded_devices[name] = Device(name=name, controllers=[])
 
                     if p_dev and usage and low and high:
                         try:
                             ctrl = Controller(
                                 primary_device=p_dev,
                                 usage=usage,
-                                amperage=(float(low), float(high))
+                                amperage=(float(low), float(high)),
+                                firmware=fw
                             )
                             loaded_devices[name].controllers.append(ctrl)
                         except ValueError:
                             pass
 
             self.devices = list(loaded_devices.values())
-            
-            for d in self.devices:
-                if d.firmware and d.firmware not in self.firmware_files:
-                    self.firmware_files.append(d.firmware)
-                    self.firmware_list.insert("end", d.firmware)
-
             self._refresh_devices()
             self._log(f"Дані успішно завантажено з файлу {CSV_FILENAME}")
         except Exception as e:
@@ -513,15 +538,14 @@ class ProgrammerApp:
         self.root.destroy()
 
     def _add_device(self):
-        base_name = "Пристрій"
+        base_name = "CPO150"
         name = base_name
         counter = 1
         while any(d.name == name for d in self.devices):
             counter += 1
-            name = f"{base_name} {counter}"
+            name = f"{base_name}_{counter}"
 
-        default_ctrl = Controller(PRIMARY_DEVICES[0], (1.0, 5.0), USAGES[0])
-        device = Device(name=name, controllers=[default_ctrl])
+        device = Device(name=name)
         self.devices.append(device)
         self._refresh_devices()
         self._select_device(device)
@@ -540,6 +564,11 @@ class ProgrammerApp:
         self._refresh_devices()
         self._select_device(device)
         self._save_devices_to_csv()
+
+    def _browse_new_firmware(self):
+        path = filedialog.askopenfilename(filetypes=[("Hex files", "*.hex"), ("Усі файли", "*.*")])
+        if path:
+            self.new_fw_var.set(path)
 
     def _select_device(self, device):
         if device not in self.devices:
@@ -562,7 +591,8 @@ class ProgrammerApp:
         for item in self.tree.get_children():
             self.tree.delete(item)
         for c in device.controllers:
-            self.tree.insert("", "end", values=(c.primary_device, c.usage, f"{c.amperage[0]} – {c.amperage[1]} A"))
+            fw_name = Path(c.firmware).name if c.firmware else "❌ Відсутня"
+            self.tree.insert("", "end", values=(c.primary_device, c.usage, f"{c.amperage[0]} – {c.amperage[1]} A", fw_name))
 
     def _add_controller(self):
         selected = self.device_list.curselection()
@@ -573,10 +603,13 @@ class ProgrammerApp:
         try:
             low = float(self.new_low_var.get().replace(",", "."))
             high = float(self.new_high_var.get().replace(",", "."))
+            fw = self.new_fw_var.get().strip()
+            
             ctrl = Controller(
                 primary_device=self.new_type_var.get(),
                 amperage=(low, high),
-                usage=self.new_usage_var.get()
+                usage=self.new_usage_var.get(),
+                firmware=fw
             )
         except (ValueError, TypeError) as e:
             messagebox.showerror("Помилка", str(e))
@@ -584,10 +617,33 @@ class ProgrammerApp:
 
         device = self.devices[selected[0]]
         device.controllers.append(ctrl)
+        self.new_fw_var.set("") # скинути поле після додавання
         self._refresh_tree(device)
-        self._refresh_devices()
         self._save_devices_to_csv()
-        self._log(f"Додано контролер до пристрою {device.name}")
+        self._on_flash_device_selected()
+        self._log(f"Додано контролер ({ctrl.primary_device}) з прошивкою до пристрою {device.name}")
+
+    def _change_controller_firmware(self):
+        selected_device = self.device_list.curselection()
+        if not selected_device:
+            return
+        device = self.devices[selected_device[0]]
+
+        selected_item = self.tree.selection()
+        if not selected_item:
+            messagebox.showwarning("Увага", "Виберіть контролер у таблиці для зміни його прошивки.")
+            return
+
+        idx = self.tree.index(selected_item[0])
+        ctrl = device.controllers[idx]
+
+        path = filedialog.askopenfilename(filetypes=[("Hex files", "*.hex"), ("Усі файли", "*.*")])
+        if path:
+            ctrl.firmware = path
+            self._refresh_tree(device)
+            self._save_devices_to_csv()
+            self._on_flash_device_selected()
+            self._log(f"Оновлено прошивку для контролера #{idx+1} пристрою {device.name}")
 
     def _delete_controller(self):
         selected = self.device_list.curselection()
@@ -600,15 +656,11 @@ class ProgrammerApp:
             messagebox.showwarning("Увага", "Виберіть контролер у таблиці для видалення.")
             return
 
-        if len(device.controllers) <= 1:
-            messagebox.showwarning("Увага", "Пристрій повинен мати хоча б один контролер.")
-            return
-
         idx = self.tree.index(selected_item[0])
         device.controllers.pop(idx)
         self._refresh_tree(device)
-        self._refresh_devices()
         self._save_devices_to_csv()
+        self._on_flash_device_selected()
         self._log(f"Видалено контролер з пристрою {device.name}")
 
     def _delete_device(self):
@@ -632,160 +684,124 @@ class ProgrammerApp:
         self._on_flash_device_selected()
 
     def _on_flash_device_selected(self, event=None):
-        self.cpu1_done = False
-        self.btn_flash2.config(state="disabled")
-        self.status_bar1.config(text="Статус: Очікування прошивання CPU 1", foreground="gray")
-        self.status_bar2.config(text="Статус: Заблоковано (потрібно завершити CPU 1)", foreground="gray")
+        """Динамічно будує блоки прошивання під всі контролери вибраного пристрою."""
+        for child in self.flash_steps_container.winfo_children():
+            child.destroy()
+
+        self.flash_step_widgets.clear()
+        self.current_flash_step = 0
 
         name = self.flash_device_var.get()
         device = next((d for d in self.devices if d.name == name), None)
-        
-        if not device:
-            self.flash_info.config(text="Виберіть пристрій.")
-            self.frame_cpu2.pack_forget()
+
+        if not device or not device.controllers:
+            ttk.Label(
+                self.flash_steps_container, 
+                text="У вибраному пристрої немає доданих контролерів або пристрій не вибрано.", 
+                foreground="red"
+            ).pack(anchor="w", pady=10)
             return
 
-        has_two_cpu = any(c.primary_device in TWO_CPU_DEVICES for c in device.controllers)
+        # Будуємо інтерфейс для кожного контролера у пристрої
+        for idx, ctrl in enumerate(device.controllers):
+            step_num = idx + 1
+            frame = ttk.LabelFrame(
+                self.flash_steps_container, 
+                text=f"Крок {step_num}: Контролер '{ctrl.primary_device}' ({ctrl.usage}, {ctrl.amperage[0]}-{ctrl.amperage[1]}A)", 
+                padding=10
+            )
+            frame.pack(fill="x", pady=5)
 
-        if has_two_cpu:
-            self.frame_cpu2.pack(fill="x", pady=(0, 8))
-            c1 = next((c for c in device.controllers if c.primary_device in TWO_CPU_DEVICES), device.controllers[0])
-            self.flash_usage1_var.set(c1.usage)
-            self.flash_low1_var.set(str(c1.amperage[0]))
-            self.flash_high1_var.set(str(c1.amperage[1]))
+            fw_name = Path(ctrl.firmware).name if ctrl.firmware else "❌ Прошивка відсутня!"
+            lbl_fw = ttk.Label(frame, text=f"Файл прошивки: {fw_name}", font=("Segoe UI", 9, "bold"))
+            lbl_fw.pack(anchor="w", pady=(0, 5))
 
-            c2 = device.controllers[1] if len(device.controllers) > 1 else c1
-            self.flash_usage2_var.set(c2.usage)
-            self.flash_low2_var.set(str(c2.amperage[0]))
-            self.flash_high2_var.set(str(c2.amperage[1]))
-        else:
-            self.frame_cpu2.pack_forget()
-            if device.controllers:
-                c1 = device.controllers[0]
-                self.flash_usage1_var.set(c1.usage)
-                self.flash_low1_var.set(str(c1.amperage[0]))
-                self.flash_high1_var.set(str(c1.amperage[1]))
+            f_act = ttk.Frame(frame)
+            f_act.pack(fill="x")
 
-        self._update_flash_info_text(device)
+            status_lbl = ttk.Label(
+                f_act, 
+                text="Статус: Очікування" if step_num == 1 else "Статус: Заблоковано (чекає попередній крок)", 
+                foreground="gray"
+            )
+            status_lbl.pack(side="left")
 
-    def _update_flash_info_text(self, device):
-        total_cpus = sum(2 if c.primary_device in TWO_CPU_DEVICES else 1 for c in device.controllers)
-        ctrl_text = "\n".join([f"  • {c.primary_device} ({c.usage}, {c.amperage[0]}–{c.amperage[1]}A)" for c in device.controllers])
+            btn_flash = ttk.Button(
+                f_act, 
+                text=f"Прошити контролер #{step_num}", 
+                state="normal" if step_num == 1 else "disabled",
+                command=lambda i=idx: self._flash_controller_step(i)
+            )
+            btn_flash.pack(side="right")
 
-        self.flash_info.config(
-            text=f"Пристрій: {device.name}\n"
-                 f"Контролери:\n{ctrl_text}\n"
-                 f"Всього CPU: {total_cpus}\n"
-                 f"Прошивка: {device.firmware or 'Не вибрана'}"
+            self.flash_step_widgets.append({
+                "status": status_lbl,
+                "button": btn_flash,
+                "controller": ctrl
+            })
+
+    def _generate_temp_bat(self, firmware_path: str) -> str:
+        bat_name = self.settings.get("bat_filename", "flash_script.bat")
+        cmd_template = self.settings.get("cmd_template", "")
+        command = cmd_template.replace("{firmware}", firmware_path).replace("{port}", self.programmer.port or "COM1")
+
+        bat_content = (
+            "@ECHO OFF\n"
+            "chcp 65001 >nul\n"
+            "SET PATH=C:\\Program Files\\Atmel\\AVR Tools\\STK500;%PATH%\n\n"
+            f"{command}\n\n"
+            "PAUSE\n"
         )
+        with open(bat_name, "w", encoding="cp1251") as f:
+            f.write(bat_content)
+        return bat_name
 
-    def _add_firmware(self):
-        path = filedialog.askopenfilename(filetypes=[("Файли прошивок", "*.hex *.bin *.elf"), ("Усі", "*.*")])
-        if path and path not in self.firmware_files:
-            self.firmware_files.append(path)
-            self.firmware_list.insert("end", path)
-            selected = self.device_list.curselection()
-            if selected:
-                self.devices[selected[0]].firmware = path
-                self._on_flash_device_selected()
-                self._save_devices_to_csv()
-
-    def _delete_firmware(self):
-        sel = self.firmware_list.curselection()
-        if not sel:
-            return
-        path = self.firmware_files.pop(sel[0])
-        self.firmware_list.delete(sel[0])
-        for d in self.devices:
-            if d.firmware == path:
-                d.firmware = ""
-        self._on_flash_device_selected()
-        self._save_devices_to_csv()
-
-    def _flash_cpu1(self):
+    def _flash_controller_step(self, step_idx: int):
         if not self.programmer.connected:
-            messagebox.showerror("Помилка", "Програматор не підключено! Виберіть COM-порт і натисніть 'Підключити'.")
+            messagebox.showerror("Помилка", "Програматор не підключено! Оберіть порт у налаштуваннях (⚙️) і натисніть 'Підключити'.")
             return
 
-        name = self.flash_device_var.get()
-        device = next((d for d in self.devices if d.name == name), None)
-        if not device:
-            messagebox.showwarning("Увага", "Виберіть пристрій.")
-            return
+        widget_info = self.flash_step_widgets[step_idx]
+        ctrl = widget_info["controller"]
 
-        template = self.settings.get("template_cpu1", "")
-        if not template:
-            messagebox.showerror("Помилка", "Не вказано шаблон команди для CPU 1 у налаштуваннях (⚙️).")
+        if not ctrl.firmware or not Path(ctrl.firmware).is_file():
+            messagebox.showerror("Помилка", f"Файл прошивки для контролера #{step_idx+1} не знайдено або не вказано!")
             return
 
         try:
-            self.status_bar1.config(text="Статус: Генерація та виконання батника CPU 1...", foreground="blue")
+            widget_info["status"].config(text=f"Статус: Виконання STK500 для контролера #{step_idx+1}...", foreground="blue")
             self.root.update()
 
-            # Генерація та запуск скрипта
-            res = self.programmer.generate_and_run_script(template, device.firmware, self.programmer.port)
-            
-            self.status_bar1.config(text="Статус: Успішно прошито CPU 1 ✔", foreground="green")
-            self._log(f"CPU 1: {res}")
-            
-            self.cpu1_done = True
+            bat_file = self._generate_temp_bat(ctrl.firmware)
+            res = self.programmer.run_bat_file(bat_file, ctrl.firmware, self.programmer.port)
 
-            has_two_cpu = any(c.primary_device in TWO_CPU_DEVICES for c in device.controllers)
-            if has_two_cpu:
+            widget_info["status"].config(text=f"Статус: Успішно прошито ✔", foreground="green")
+            widget_info["button"].config(state="disabled")
+            self._log(f"Контролер #{step_idx+1} ({ctrl.primary_device}): {res}")
+
+            next_step = step_idx + 1
+            if next_step < len(self.flash_step_widgets):
                 messagebox.showinfo(
-                    "Змініть порт / підключення", 
-                    "Прошивання CPU 1 завершено!\n\n"
-                    "Будь ласка, перекиньте кабель на **другий порт** для прошивання CPU 2."
+                    "Переключіть порт", 
+                    f"Прошивання контролера #{step_idx+1} завершено!\n\n"
+                    f"Будь ласка, підключіть кабель до **наступного порту / контролера #{next_step+1}**."
                 )
                 self.programmer.disconnect()
-                self.status_label.config(text="● Зв'язок втрачено (змініть порт)", foreground="orange")
-                self.btn_connect.config(text="Підключити")
+                self.status_label.config(text="● Не підключено", foreground="red")
+                self.btn_connect_quick.config(text="Підключити")
                 self.port_combo.config(state="readonly")
-                
-                if messagebox.askyesno("Перевірка порту", "Чи підключено пристрій до наступного порту та готово до підключення?"):
+
+                if messagebox.askyesno("Перевірка підключення", f"Чи підключено кабель до контролера #{next_step+1} та готово до підключення?"):
                     self._toggle_connection()
                     if self.programmer.connected:
-                        self.btn_flash2.config(state="normal")
-                        self.status_bar2.config(text="Статус: Готовий до прошивання CPU 2", foreground="blue")
+                        next_widget = self.flash_step_widgets[next_step]
+                        next_widget["button"].config(state="normal")
+                        next_widget["status"].config(text="Статус: Готово до прошивання", foreground="blue")
             else:
-                messagebox.showinfo("Результат", f"Прошивання успішно завершено!\n{res}")
+                messagebox.showinfo("Успіх!", "Усі контролери цього пристрою успішно прошито!")
 
         except Exception as e:
-            self.status_bar1.config(text="Статус: Помилка прошивання CPU 1 ❌", foreground="red")
-            messagebox.showerror("Помилка", str(e))
-
-    def _flash_cpu2(self):
-        if not self.cpu1_done:
-            messagebox.showerror("Помилка", "Неможливо почати прошивання CPU 2: перше прошивання не завершено!")
-            return
-
-        if not self.programmer.connected:
-            messagebox.showerror("Помилка", "Програматор не підключено на новому порті!")
-            return
-
-        name = self.flash_device_var.get()
-        device = next((d for d in self.devices if d.name == name), None)
-        if not device:
-            messagebox.showwarning("Увага", "Виберіть пристрій.")
-            return
-
-        template = self.settings.get("template_cpu2", "")
-        if not template:
-            messagebox.showerror("Помилка", "Не вказано шаблон команди для CPU 2 у налаштуваннях (⚙️).")
-            return
-
-        try:
-            self.status_bar2.config(text="Статус: Генерація та виконання батника CPU 2...", foreground="blue")
-            self.root.update()
-
-            res = self.programmer.generate_and_run_script(template, device.firmware, self.programmer.port)
-            
-            self.status_bar2.config(text="Статус: Успішно прошито CPU 2 ✔", foreground="green")
-            self._log(f"CPU 2: {res}")
-            messagebox.showinfo("Результат", f"Усі етапи успішно завершено!\n\n{res}")
-
-        except Exception as e:
-            self.status_bar2.config(text="Статус: Помилка прошивання CPU 2 ❌", foreground="red")
+            widget_info["status"].config(text="Статус: Помилка прошивання ❌", foreground="red")
             messagebox.showerror("Помилка", str(e))
 
 

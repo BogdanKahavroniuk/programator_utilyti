@@ -1,4 +1,9 @@
 {
+    "selected_port": "COM4",
+    "bat_filename": "flash_script.bat",
+    "cmd_template": "STK500.exe -cUSB -I125kHz -dAtmega64 -s -e -i\"{firmware}\" -pb -vb -O0003 -Sf7fff -fD124 -EFF -FD124 -GFF -lFC -LFC",
+    "cmd_cpu1": "avrdude -p atmega328p -c arduino -P {port} -b 115200 -U flash:w:\"{firmware}\":i",
+    "cmd_cpu2": "avrdude -p atmega328p -c arduino -P {port} -b 115200 -U flash:w:\"{firmware}\":i",
     "template_cpu1": "avrdude -p atmega328p -c arduino -P {port} -b 115200 -U flash:w:\"{firmware}\":i",
     "template_cpu2": "avrdude -p atmega328p -c arduino -P {port} -b 115200 -U flash:w:\"{firmware}\":i",
     "bat_cpu1": "",
